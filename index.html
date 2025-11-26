@@ -1,0 +1,429 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Aether Drift: Mini HTML Prototype</title>
+    <style>
+        html,body {height:100%;margin:0;background:#0b0f16;color:#dde; font-family:system-ui,Segoe UI,Roboto;}
+        #game {display:block;background:#071022;margin:0 auto;box-shadow:0 6px 30px rgba(0,0,0,.6);image-rendering:pixelated;}
+        .ui {position:fixed;left:12px;top:12px;color:#cfe;padding:8px;background:rgba(0,0,0,0.25);border-radius:6px}
+        .hint{font-size:12px;opacity:.9}
+        .bar {width:160px;height:10px;background:#234;border-radius:6px;overflow:hidden;margin-top:6px}
+        .bar > i {display:block;height:100%;background:linear-gradient(90deg,#7ff,#3af);width:0%}
+    </style>
+</head>
+<body>
+<canvas id="game" width="900" height="540"></canvas>
+<div class="ui">
+    <div><strong>Aether Drift — Prototype</strong></div>
+    <div class="hint">WASD / Arrows: move · Space: Phase · E: Insert Key · F: Attack</div>
+    <div style="margin-top:6px">Phase: <span id="phaseState">ready</span></div>
+    <div class="bar"><i id="phaseBar"></i></div>
+    <div style="margin-top:6px">Held Key: <span id="heldKey">—</span></div>
+    <div>Echoes: <span id="echoCount">0</span></div>
+</div>
+
+<script>
+/*
+A compact canvas prototype capturing core systems from the Unity C# description:
+- Shard (player) with Phase-Shift (duration + cooldown). When phased, can pass through walls.
+- PrismKey pickup and Projector insertion to animate labyrinth geometry (moving walls).
+- Sentinels (enemies) vulnerable only when phased.
+- EchoMemory collectibles that add to a simple log.
+All in one HTML file for GitHub Pages.
+*/
+
+const canvas = document.getElementById('game'), ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+let keys = {}, tick=0;
+addEventListener('keydown', e => { keys[e.code]=true; e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.code]=false; });
+
+/* Utility */
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function dist(ax,ay,bx,by){const dx=ax-bx, dy=ay-by; return Math.hypot(dx,dy);}
+/* Circle-rect collision */
+function circleRectCollides(cx,cy,r,rx,ry,rw,rh){
+    const nearestX = clamp(cx, rx, rx+rw);
+    const nearestY = clamp(cy, ry, ry+rh);
+    return dist(cx,cy,nearestX,nearestY) <= r;
+}
+
+/* Game state */
+const uiPhaseState = document.getElementById('phaseState'), uiPhaseBar = document.getElementById('phaseBar');
+const uiHeldKey = document.getElementById('heldKey'), uiEchoCount = document.getElementById('echoCount');
+
+/* Player / Shard */
+const player = {
+    x:100, y:100, r:12, speed:160,
+    phased:false, canPhase:true, phaseDuration:3.0, phaseCooldown:2.0,
+    _phaseTimer:0, _cooldownTimer:0,
+    heldKeyId: null, echoes:[],
+    attackRange:22
+};
+
+function startPhase(){
+    if(!player.canPhase) return;
+    player.phased = true;
+    player.canPhase = false;
+    player._phaseTimer = player.phaseDuration;
+    uiPhaseState.textContent = 'PHASED';
+}
+function endPhase(){
+    player.phased = false;
+    player._cooldownTimer = player.phaseCooldown;
+    uiPhaseState.textContent = 'cooling';
+}
+
+/* Walls and geometry sets */
+let walls = [
+    // static walls: x,y,w,h
+    {x:0,y:0,w:900,h:16, movable:false},
+    {x:0,y:524,w:900,h:16, movable:false},
+    {x:0,y:0,w:16,h:540, movable:false},
+    {x:884,y:0,w:16,h:540, movable:false},
+    // inner labyrinth
+    {x:220,y:80,w:16,h:200, movable:false},
+    {x:360,y:260,w:260,h:16, movable:false},
+    {x:560,y:120,w:16,h:220, movable:false},
+    // moveable set (will animate)
+    {x:420,y:80,w:16,h:120, movable:true, id:0},
+    {x:440,y:200,w:120,h:16, movable:true, id:0}
+];
+
+/* Geometry sets: move walls when prism applied */
+const geometrySets = [
+    {
+        prismId: 1,
+        targets: walls.filter(w=>w.movable && w.id===0),
+        // each target has goal offsets (dx,dy) relative to original
+        goals: [{dx:0,dy:-120},{dx:140,dy:0}],
+        duration:1.2,
+        curve: t=> t<.5 ? (2*t*t) : (1 - 2*(1-t)*(1-t)), // ease in/out
+        applied: false,
+        progress:0,
+        animating:false
+    }
+];
+
+/* Prism keys (pickup items) */
+let prismKeys = [
+    {x:140,y:420,prismId:1,name:"Prism Key A", picked:false}
+];
+
+/* Projectors */
+let projectors = [
+    {x:760,y:100, reqId:1, radius:28, inserted:false}
+];
+
+/* Sentinels (enemies) */
+let sentinels = [
+    {x:500,y:360, r:14, p1:{x:500,y:360}, p2:{x:740,y:360}, t:0, speed:60, health:3, vulnerableOnlyWhenPhased:true}
+];
+
+/* EchoMemory collectibles */
+let echoes = [
+    {x:300,y:120, text:"Fragment: first shimmer", collected:false},
+    {x:620,y:200, text:"Fragment: glass whispers", collected:false}
+];
+
+/* Simple particle / shatter system */
+let particles = [];
+function spawnShatter(x,y,clr){
+    for(let i=0;i<16;i++){
+        particles.push({x,y,vx:(Math.random()-0.5)*220, vy:(Math.random()-0.5)*220, life:0.6+Math.random()*0.6, c:clr});
+    }
+}
+
+/* Input helpers */
+function near(a,b,distThreshold){ return dist(a.x,a.y,b.x,b.y) <= distThreshold; }
+
+/* Apply prism key -> animate geometry set */
+function applyPrism(prismId){
+    const set = geometrySets.find(s=>s.prismId===prismId);
+    if(!set) return;
+    if(set.animating) return;
+    set.animating = true;
+    set.progress = 0;
+    set.applied = !set.applied; // toggle final
+    // cache originals
+    set.orig = set.targets.map(t=>({x:t.x,y:t.y}));
+    // compute direction: if applied true, move to goal positions; else move back to orig
+}
+
+/* Update loop */
+let last = performance.now();
+function update(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+    tick += dt;
+
+    // Player movement
+    let vx=0, vy=0;
+    if(keys['KeyW']||keys['ArrowUp']) vy-=1;
+    if(keys['KeyS']||keys['ArrowDown']) vy+=1;
+    if(keys['KeyA']||keys['ArrowLeft']) vx-=1;
+    if(keys['KeyD']||keys['ArrowRight']) vx+=1;
+    const len = Math.hypot(vx,vy) || 1;
+    vx = vx/len * player.speed * dt;
+    vy = vy/len * player.speed * dt;
+
+    // attempt move with collision if not phased
+    let nx = player.x + vx, ny = player.y + vy;
+    if(!player.phased){
+        // check collisions with walls
+        for(const w of walls){
+            if(circleRectCollides(nx, ny, player.r, w.x, w.y, w.w, w.h)){
+                // simple separation: try axis-aligned move resolution
+                if(!circleRectCollides(player.x + vx, player.y, player.r, w.x, w.y, w.w, w.h)) nx = player.x;
+                else if(!circleRectCollides(player.x, player.y + vy, player.r, w.x, w.y, w.w, w.h)) ny = player.y;
+                else { nx = player.x; ny = player.y; }
+            }
+        }
+    }
+    player.x = clamp(nx, 20, W-20);
+    player.y = clamp(ny, 20, H-20);
+
+    // phase timers
+    if(player.phased){
+        player._phaseTimer -= dt;
+        if(player._phaseTimer <= 0) endPhase();
+    } else {
+        if(!player.canPhase){
+            player._cooldownTimer -= dt;
+            if(player._cooldownTimer <= 0){ player.canPhase = true; uiPhaseState.textContent='ready'; }
+        }
+    }
+    // phase key input
+    if((keys['Space'] || keys['KeyZ']) && !keys._handledPhase){
+        keys._handledPhase = true;
+        if(!player.phased) startPhase();
+        else { endPhase(); }
+    }
+    if(!(keys['Space'] || keys['KeyZ'])) keys._handledPhase = false;
+
+    // attack: F
+    if((keys['KeyF'] || keys['Numpad0']) && !keys._handledF){
+        keys._handledF = true;
+        // attempt attack all sentinels in range
+        for(const s of sentinels){
+            if(dist(player.x,player.y,s.x,s.y) <= player.attackRange + s.r){
+                // vulnerability rule
+                const shardPhased = player.phased;
+                if(s.vulnerableOnlyWhenPhased && !shardPhased){
+                    // reflect or no effect: simple feedback
+                    spawnShatter(s.x, s.y, '#88a'); // flash
+                } else {
+                    s.health -= 1;
+                    spawnShatter(s.x, s.y, '#f55');
+                    if(s.health <= 0){
+                        spawnShatter(s.x, s.y, '#ffd');
+                        s.dead = true;
+                    }
+                }
+            }
+        }
+    }
+    if(!(keys['KeyF'] || keys['Numpad0'])) keys._handledF = false;
+
+    // Pick up keys (PrismKey)
+    for(const pk of prismKeys){
+        if(pk.picked) continue;
+        if(dist(player.x,player.y,pk.x,pk.y) <= 16 + player.r){
+            pk.picked = true;
+            player.heldKeyId = pk.prismId;
+            uiHeldKey.textContent = pk.name;
+        }
+    }
+
+    // Insert key into projector
+    for(const proj of projectors){
+        if(dist(player.x,player.y,proj.x,proj.y) <= proj.radius + player.r){
+            if((keys['KeyE']||keys['KeyX']) && !keys._handledE){
+                keys._handledE = true;
+                if(proj.inserted) { /* already used */ }
+                else if(player.heldKeyId === proj.reqId){
+                    proj.inserted = true;
+                    player.heldKeyId = null; uiHeldKey.textContent='—';
+                    applyPrism(proj.reqId);
+                } else {
+                    // wrong key feedback
+                    spawnShatter(proj.x,proj.y,'#446');
+                }
+            }
+        }
+    }
+    if(!(keys['KeyE']||keys['KeyX'])) keys._handledE = false;
+
+    // Sentinels movement & collisions with player
+    for(const s of sentinels){
+        if(s.dead) continue;
+        s.t += dt * (s.speed/((Math.abs(s.p2.x-s.p1.x)+Math.abs(s.p2.y-s.p1.y))||1));
+        const p = 0.5 + 0.5 * Math.sin(s.t * Math.PI*2); // oscillate 0..1
+        s.x = s.p1.x*(1-p) + s.p2.x*p;
+        s.y = s.p1.y*(1-p) + s.p2.y*p;
+        // if colliding with player and player not phased -> damage effect
+        if(!player.phased && dist(player.x,player.y,s.x,s.y) <= s.r + player.r){
+            // push player slightly
+            const dx = player.x - s.x, dy = player.y - s.y;
+            const len = Math.hypot(dx,dy) || 1;
+            player.x += (dx/len)*6; player.y += (dy/len)*6;
+            // small feedback
+        }
+    }
+    // remove dead sentinels
+    for(let i=sentinels.length-1;i>=0;i--) if(sentinels[i].dead) sentinels.splice(i,1);
+
+    // EchoMemory collection
+    for(const e of echoes){
+        if(e.collected) continue;
+        if(dist(player.x,player.y,e.x,e.y) <= player.r + 10){
+            e.collected = true;
+            player.echoes.push(e.text);
+            uiEchoCount.textContent = player.echoes.length;
+            // log
+            console.log("Collected Echo:", e.text);
+        }
+    }
+
+    // Geometry animators
+    for(const set of geometrySets){
+        if(set.animating){
+            set.progress += dt / set.duration;
+            const t = clamp(set.progress,0,1);
+            const p = set.curve(t);
+            // move targets between orig and goal or back depending on applied flag
+            for(let i=0;i<set.targets.length;i++){
+                const tgt = set.targets[i];
+                const orig = set.orig[i];
+                const goal = {x: orig.x + (set.goals[i].dx||0), y: orig.y + (set.goals[i].dy||0)};
+                const dest = set.applied ? goal : orig;
+                const from = set.applied ? orig : goal;
+                tgt.x = from.x*(1-p) + dest.x*p;
+                tgt.y = from.y*(1-p) + dest.y*p;
+            }
+            if(set.progress >= 1) set.animating = false;
+        }
+    }
+
+    // Particles
+    for(let i=particles.length-1;i>=0;i--){
+        const pr = particles[i];
+        pr.life -= dt;
+        pr.x += pr.vx*dt; pr.y += pr.vy*dt;
+        pr.vy += 180*dt;
+        pr.vx *= 0.99;
+        if(pr.life<=0) particles.splice(i,1);
+    }
+
+    // UI phase bar
+    const barPct = player.phased ? (player._phaseTimer / player.phaseDuration) : (!player.canPhase ? (1 - player._cooldownTimer / player.phaseCooldown) : 0);
+    uiPhaseBar.style.width = (barPct*100).toFixed(1)+'%';
+    last = now;
+    draw();
+    requestAnimationFrame(update);
+}
+
+/* Rendering */
+function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // background grid
+    ctx.fillStyle = '#061322';
+    ctx.fillRect(0,0,W,H);
+
+    // subtle grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 1;
+    for(let gx=0;gx<W;gx+=40){
+        ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke();
+    }
+    for(let gy=0;gy<H;gy+=40){
+        ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke();
+    }
+
+    // projectors
+    for(const p of projectors){
+        ctx.save();
+        ctx.translate(p.x,p.y);
+        ctx.fillStyle = p.inserted ? '#7ff' : '#38b';
+        ctx.beginPath(); ctx.arc(0,0, p.radius, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.font = '12px monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('PRJ',0,0);
+        ctx.restore();
+    }
+
+    // walls
+    for(const w of walls){
+        ctx.fillStyle = w.movable ? '#3b6' : '#123';
+        ctx.fillRect(w.x, w.y, w.w, w.h);
+        ctx.strokeStyle = 'rgba(255,255,255,0.04)'; ctx.strokeRect(w.x,w.y,w.w,w.h);
+    }
+
+    // prism keys
+    for(const pk of prismKeys){
+        if(pk.picked) continue;
+        ctx.fillStyle = '#fdb';
+        ctx.beginPath(); ctx.arc(pk.x,pk.y,10,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#000'; ctx.font='11px sans-serif'; ctx.textAlign='center'; ctx.fillText('K', pk.x, pk.y+1);
+    }
+
+    // echoes
+    for(const e of echoes){
+        if(e.collected) continue;
+        ctx.fillStyle = '#9cf';
+        ctx.beginPath(); ctx.arc(e.x,e.y,8,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.font='11px sans-serif'; ctx.textAlign='center'; ctx.fillText('E', e.x, e.y+1);
+    }
+
+    // sentinels
+    for(const s of sentinels){
+        ctx.save();
+        ctx.translate(s.x,s.y);
+        ctx.fillStyle = '#d55';
+        ctx.beginPath(); ctx.arc(0,0,s.r,0,Math.PI*2); ctx.fill();
+        // health
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(-s.r, -s.r-8, s.r*2, 6);
+        ctx.fillStyle = '#ff7'; ctx.fillRect(-s.r, -s.r-8, (s.health/3)*s.r*2, 6);
+        ctx.restore();
+    }
+
+    // player
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    if(player.phased){
+        ctx.fillStyle = 'rgba(120,200,255,0.28)';
+        ctx.beginPath(); ctx.arc(0,0, player.r*1.8,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = 'rgba(150,230,255,0.95)';
+    } else {
+        ctx.fillStyle = '#cfe';
+    }
+    ctx.beginPath(); ctx.arc(0,0, player.r, 0, Math.PI*2); ctx.fill();
+    // small eye
+    ctx.fillStyle = player.phased ? '#034' : '#024';
+    ctx.beginPath(); ctx.arc(4, -2, 3, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // particles
+    for(const p of particles){
+        ctx.fillStyle = p.c;
+        ctx.fillRect(p.x-1.5, p.y-1.5, 3,3);
+    }
+
+    // overlays: projector prompts
+    for(const proj of projectors){
+        if(dist(player.x,player.y,proj.x,proj.y) <= proj.radius + player.r){
+            ctx.fillStyle = 'rgba(255,255,255,0.08)';
+            ctx.fillRect(proj.x-70, proj.y+proj.radius+8, 140, 26);
+            ctx.fillStyle = '#fff'; ctx.font='12px sans-serif'; ctx.textAlign='center';
+            ctx.fillText(proj.inserted ? 'Inserted' : `Press E to insert key ${proj.reqId}`, proj.x, proj.y+proj.radius+24);
+        }
+    }
+}
+
+/* Start the loop */
+requestAnimationFrame(update);
+</script>
+</body>
+</html>
